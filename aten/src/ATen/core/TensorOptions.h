@@ -68,12 +68,12 @@ struct CAFFE2_API TensorOptions {
 
   /// Constructs a `TensorOptions` object with the given layout.
   /* implicit */ TensorOptions(Layout layout) : TensorOptions() {
-    this->layout(layout);
+    this->set_layout(layout);
   }
 
   /// Constructs a `TensorOptions` object with the given device.
   /* implicit */ TensorOptions(Device device) : TensorOptions() {
-    this->device(device);
+    this->set_device(device);
   }
 
   /// Constructs a `TensorOptions` object from a backend, forwarded to the
@@ -88,7 +88,7 @@ struct CAFFE2_API TensorOptions {
 
   /// Constructs a `TensorOptions` object with the given dtype.
   /* implicit */ TensorOptions(ScalarType dtype) : TensorOptions() {
-    this->dtype(dtype);
+    this->set_dtype(dtype);
   }
 
   /// True if all elements of the `TensorOptions` match that of the other.
@@ -112,52 +112,47 @@ struct CAFFE2_API TensorOptions {
     return !(*this == other);
   }
 
-  /// Sets the device of the `TensorOptions`.
-  TensorOptions device(Device device) const noexcept {
+  /// Return a copy of `TensorOptions` with `device` set to the given one.
+  C10_NODISCARD TensorOptions device(Device device) const noexcept {
     TensorOptions r = *this;
-    r.device_ = device;
-    r.has_device_ = true;
+    r.set_device(device);
     return r;
   }
 
-  /// Sets the device of the `TensorOptions` to CUDA, and then sets the device
-  /// index to the given one.
+  /// Return a copy of `TensorOptions`, but with device set to CUDA, and the
+  /// device index set to the given one.
   ///
   /// TODO: This function encourages bad behavior (assuming CUDA is
   /// the only device that matters).  Get rid of it / rename it.
-  TensorOptions device_index(int32_t device_index) const noexcept {
+  C10_NODISCARD TensorOptions device_index(int32_t device_index) const noexcept {
     return device({Device::Type::CUDA, device_index});
   }
 
-  /// Sets the dtype of the `TensorOptions`.
-  TensorOptions dtype(ScalarType dtype) const noexcept {
+  /// Return a copy of `TensorOptions` with `dtype` set to the given one.
+  C10_NODISCARD TensorOptions dtype(ScalarType dtype) const noexcept {
     TensorOptions r = *this;
-    r.dtype_ = dtype;
-    r.has_dtype_ = true;
+    r.set_dtype(dtype);
     return r;
   }
 
   /// Sets the layout of the `TensorOptions`.
-  TensorOptions layout(Layout layout) const noexcept {
+  C10_NODISCARD TensorOptions layout(Layout layout) const noexcept {
     TensorOptions r = *this;
-    r.layout_ = layout;
-    r.has_layout_ = true;
+    r.set_layout(layout);
     return r;
   }
 
   /// Sets the `requires_grad` property of the `TensorOptions`.
-  TensorOptions requires_grad(bool requires_grad) const noexcept {
+  C10_NODISCARD TensorOptions requires_grad(bool requires_grad) const noexcept {
     TensorOptions r = *this;
-    r.requires_grad_ = requires_grad;
-    r.has_requires_grad_ = true;
+    r.set_requires_grad(requires_grad);
     return r;
   }
 
   /// Sets the `is_variable` property on the `TensorOptions`.
-  TensorOptions is_variable(bool is_variable) const noexcept {
+  C10_NODISCARD TensorOptions is_variable(bool is_variable) const noexcept {
     TensorOptions r = *this;
-    r.is_variable_ = is_variable;
-    r.has_is_variable_ = true;
+    r.set_is_variable(is_variable);
     return r;
   }
 
@@ -233,6 +228,49 @@ struct CAFFE2_API TensorOptions {
   }
 
  private:
+
+  // These methods are currently private because I'm not sure if it's wise
+  // to actually publish them.  They are methods because I need them in
+  // the constructor and the functional API implementation.
+  //
+  // If you really, really need it, you can make these public, but check if you
+  // couldn't just do what you need with the functional API.  Similarly, these
+  // methods are not chainable, because if you wanted chaining, you probably
+  // want to use the functional API instead.  (It's probably OK to make
+  // these chainable, because these functions are all explicitly annotated
+  // with a ref-qualifier, the trailing &, that makes them illegal to call
+  // on temporaries.)
+
+  /// Mutably set the device of `TensorOptions`.
+  void set_device(Device device) & noexcept {
+    device_ = device;
+    has_device_ = true;
+  }
+
+  /// Mutably set the dtype of `TensorOptions`.
+  void set_dtype(ScalarType dtype) & noexcept {
+    dtype_ = dtype;
+    has_dtype_ = true;
+  }
+
+  /// Mutably set the layout of `TensorOptions`.
+  void set_layout(Layout layout) & noexcept {
+    layout_ = layout;
+    has_layout_ = true;
+  }
+
+  /// Mutably set the `requires_grad` property of `TensorOptions`.
+  void set_requires_grad(bool requires_grad) & noexcept {
+    requires_grad_ = requires_grad;
+    has_requires_grad_ = true;
+  }
+
+  /// Mutably set the `is_variable` property of `TensorOptions`.
+  void set_is_variable(bool is_variable) & noexcept {
+    is_variable_ = is_variable;
+    has_is_variable_ = true;
+  }
+
   // WARNING: If you edit TensorOptions to add more options, you
   // must adjust the implementation of Tensor::options
 
