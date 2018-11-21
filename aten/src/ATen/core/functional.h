@@ -1,9 +1,9 @@
 #pragma once
 
 #include <vector>
-#include <ATen/core/ArrayRef.h>
+#include <c10/util/ArrayRef.h>
 
-namespace torch {
+namespace c10 {
 
 // The passed in function must take T by value (T), or by
 // const reference (const T&); taking T by non-const reference
@@ -60,4 +60,4 @@ inline std::vector<T> filter(const std::vector<T>& inputs, const F& fn) {
   return filter<F, T>(static_cast<at::ArrayRef<T>>(inputs), fn);
 }
 
-}
+} // namespace c10

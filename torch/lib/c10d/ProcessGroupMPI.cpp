@@ -2,7 +2,9 @@
 
 #include <map>
 
+#if defined(OPEN_MPI) && OPEN_MPI
 #include <mpi-ext.h> // Needed for CUDA-aware check
+#endif
 
 namespace c10d {
 
@@ -37,7 +39,8 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
     {at::kShort, MPI_SHORT},
 };
 
-// Checking CUDA-aware MPI support
+// Checking CUDA-aware MPI support, currently we only support CUDA aware
+// MPI ops through Open MPI
 bool cudaAwareMpiCheck() {
 // Run time check
 #if defined(MPIX_CUDA_AWARE_SUPPORT)
@@ -147,8 +150,11 @@ ProcessGroupMPI::AsyncWork::AsyncWork(
 
 ProcessGroupMPI::AsyncWork::~AsyncWork() {
   if (request_ != MPI_REQUEST_NULL) {
-    throw std::runtime_error(
-        "Attempted destruction of AsyncWork before work has completed");
+    std::cerr
+        << "Attempted destruction of AsyncWork before work has completed, "
+        << "terminating the program."
+        << std::endl;
+    std::terminate();
   }
 }
 
@@ -283,7 +289,8 @@ std::shared_ptr<ProcessGroupMPI> ProcessGroupMPI::createProcessGroupMPI(
   MPI_CHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
 
   MPI_Group ranksGroup;
-  MPI_CHECK(MPI_Group_incl(worldGroup, ranks.size(), ranks.data(), &ranksGroup));
+  MPI_CHECK(
+      MPI_Group_incl(worldGroup, ranks.size(), ranks.data(), &ranksGroup));
 
   MPI_Comm groupComm;
   MPI_CHECK(MPI_Comm_create(MPI_COMM_WORLD, ranksGroup, &groupComm));

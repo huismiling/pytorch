@@ -10,17 +10,15 @@
 #include "caffe2/core/context_base.h"
 #include "caffe2/core/event.h"
 #include "caffe2/core/logging.h"
-#include "caffe2/core/typeid.h"
+#include <c10/util/typeid.h>
 #include "caffe2/proto/caffe2_pb.h"
 
 #include <ATen/core/ATenCoreTest.h>
-#include <ATen/core/ArrayRef.h>
+#include <c10/util/ArrayRef.h>
 
 C10_DECLARE_bool(caffe2_report_cpu_memory_usage);
 
 namespace caffe2 {
-
-CAFFE2_API BaseStaticContext* GetCPUStaticContext();
 
 /**
  * A function to generate a random number seed that is unique in a best-effort
@@ -54,14 +52,6 @@ class CAFFE2_API CPUContext final : public BaseContext {
       : CPUContext(DeviceToOption(device)) {}
 
   ~CPUContext() noexcept override {}
-
-  BaseStaticContext* GetStaticContext() const override {
-    return GetCPUStaticContext();
-  }
-
-  static BaseStaticContext* StaticContext() {
-    return GetCPUStaticContext();
-  }
 
   inline void SwitchToDevice(int /*stream_id*/) override {}
 
@@ -155,6 +145,11 @@ class CAFFE2_API CPUContext final : public BaseContext {
     return true;
   }
 
+  at::Device device() const override {
+    // TODO: numa?
+    return at::Device(CPU);
+  }
+
   DeviceType device_type() const override {
     return CPU;
   }
@@ -181,22 +176,6 @@ inline void CPUContext::CopyBytes<CPUContext, CPUContext>(
   CAFFE_ENFORCE(dst);
   memcpy(dst, src, nbytes);
 }
-
-// TODO(jerryzh): merge CPUStaticContext with Allocator
-class CAFFE2_API CPUStaticContext : public BaseStaticContext {
- public:
-
-  DeviceType GetDeviceType() override {
-    return CPU;
-  }
-
-  void ExtractDeviceOption(DeviceOption* device, const void* /*data*/)
-      override {
-    CHECK(device);
-    device->set_device_type(TypeToProto(GetDeviceType()));
-  }
-
-};
 
 }  // namespace caffe2
 

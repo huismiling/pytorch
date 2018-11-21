@@ -2,7 +2,7 @@
 
 #include <iostream>
 
-namespace torch { namespace jit {
+namespace c10 {
 
 std::ostream& operator<<(std::ostream & out, const Type & t) {
   if(auto value = t.cast<CompleteTensorType>()) {
@@ -49,6 +49,9 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
   } else if(t.kind() == TypeKind::ListType) {
     auto prim = t.cast<ListType>()->getElementType();
     out << *prim << "[]";
+  } else if (t.kind() == TypeKind::OptionalType) {
+    auto prim = t.cast<OptionalType>()->getElementType();
+    out << *prim << "?";
   } else if(t.kind() == TypeKind::NoneType) {
     out << "None";
   } else if(t.kind() == TypeKind::StringType) {
@@ -57,8 +60,9 @@ std::ostream& operator<<(std::ostream & out, const Type & t) {
     out << "Generator";
   } else if(t.kind() == TypeKind::VarType) {
     out << t.expect<VarType>()->name();
-  } else if(t.kind() == TypeKind::WorldType) {
-    out << "World";
+  } else if(t.kind() == TypeKind::FutureType) {
+    auto elem = t.cast<FutureType>()->getElementType();
+    out << "Future[" << *elem << "]";
   } else {
     AT_ERROR("unknown type kind");
   }
@@ -97,12 +101,12 @@ GeneratorTypePtr GeneratorType::get() {
   static auto value = GeneratorType::create();
   return value;
 }
-WorldTypePtr WorldType::get() {
-  static auto value = WorldType::create();
-  return value;
-}
 StringTypePtr StringType::get() {
   static auto value = StringType::create();
+  return value;
+}
+OptionalTypePtr OptionalType::ofTensor() {
+  static auto value = OptionalType::create(DynamicType::get());
   return value;
 }
 ListTypePtr ListType::ofTensors() {
@@ -147,7 +151,7 @@ TypePtr inferTypeFrom(const IValue& value) {
   AT_ASSERTM(false, "Unhandled IValue kind in inferTypeFrom");
 }
 
-at::optional<TypePtr> unifyTypes(const TypePtr& t1, const TypePtr& t2) {
+c10::optional<TypePtr> unifyTypes(const TypePtr& t1, const TypePtr& t2) {
   //cases that t1 == t2, or t1 is a type refinement of t2 and vice versa
   if (t1->isSubtypeOf(t2)) {
     return t2;
@@ -162,79 +166,143 @@ at::optional<TypePtr> unifyTypes(const TypePtr& t1, const TypePtr& t2) {
     return static_cast<TypePtr>(DynamicType::get());;
   }
 
+  // if t1 is None and t2 is a concrete type, return Optional[t2] and vice versa
+  if (t1->isSubtypeOf(NoneType::get()) && !t2->isSubtypeOf(NoneType::get())) {
+    return OptionalType::create(t2);
+  } else if (t2->isSubtypeOf(NoneType::get()) && !t1->isSubtypeOf(NoneType::get())) {
+    return OptionalType::create(t1);
+  }
+
   //types which contain other types
   if (t1->cast<ListType>() && t2->cast<ListType>()) {
     auto unified_type = unifyTypes(t1->cast<ListType>()->getElementType(), t2->cast<ListType>()->getElementType());
     if (unified_type) {
       return static_cast<TypePtr>(ListType::create(*unified_type));
     } else {
-      return at::nullopt;
+      return c10::nullopt;
     }
   } else if(t1->cast<TupleType>() && t2->cast<TupleType>()) {
     auto tuple1 = t1->cast<TupleType>();
     auto tuple2 = t2->cast<TupleType>();
     if (tuple1->elements().size() != tuple2->elements().size()) {
-      return at::nullopt;
+      return c10::nullopt;
     }
     std::vector<TypePtr> elements;
     for (size_t i = 0; i < tuple1->elements().size(); i++) {
       if (auto elem = unifyTypes(tuple1->elements().at(i), tuple2->elements().at(i))) {
         elements.push_back(*elem);
       } else {
-        return at::nullopt;
+        return c10::nullopt;
       }
     }
     return static_cast<TypePtr>(TupleType::create(elements));
   }
 
-  return at::nullopt;
+  return c10::nullopt;
 }
 
-TypePtr matchTypeVariables(TypePtr formal, TypePtr actual, TypeEnv& type_env) {
-  if(!formal->hasFreeVariables())
-    return formal;
+MatchTypeReturn matchTypeVariables(TypePtr formal, TypePtr actual, TypeEnv& type_env) {
+  MatchTypeReturn ret;
+  if(!formal->hasFreeVariables()) {
+    ret.type = formal;
+    return ret;
+  }
+
   if(auto vt = formal->cast<VarType>()) {
     auto it = type_env.find(vt->name());
     if(it == type_env.end()) {
       type_env[vt->name()] = actual;
-      return actual;
+      ret.type = actual;
+      return ret;
     } else if(auto unified = unifyTypes(it->second, actual)) {
       type_env[vt->name()] = *unified;
-      return *unified;
+      ret.type = *unified;
+      return ret;
     }
     std::stringstream ss;
     ss << "type variable '" << vt->name() <<"' previously matched to type " <<
       it->second->str() << " is matched to type " << actual->str();
-    throw TypeMatchError(ss.str());
+    ret.errMsg = ss.str();
+    return ret;
   } else if(auto lt_formal = formal->cast<ListType>()) {
     if(auto lt_actual = actual->cast<ListType>()) {
-      return ListType::create(matchTypeVariables(lt_formal->getElementType(), lt_actual->getElementType(), type_env));
+      const auto innerType = matchTypeVariables(
+          lt_formal->getElementType(),
+          lt_actual->getElementType(),
+          type_env);
+      if (!innerType.type) {
+        // propagate the errMsg onward
+        return innerType;
+      }
+      ret.type = ListType::create(*innerType.type);
+      return ret;
     } else {
       std::stringstream ss;
       ss << "cannot match a list to " << actual->str();
-      throw TypeMatchError(ss.str());
+      ret.errMsg = ss.str();
+      return ret;
     }
   } else if(auto tp_formal = formal->cast<TupleType>()) {
     if(auto tp_actual = actual->cast<TupleType>()) {
       if(tp_formal->elements().size() != tp_actual->elements().size()) {
-        std::stringstream ss;
-        throw TypeMatchError("cannot match tuples of mismatched size");
+        ret.errMsg = "cannot match tuples of mismatched size";
+        return ret;
       }
       std::vector<TypePtr> elements;
       for(size_t i = 0; i < tp_formal->elements().size(); ++i) {
-        TypePtr result = matchTypeVariables(
+        const auto result = matchTypeVariables(
             tp_formal->elements()[i],
             tp_actual->elements()[i],
             type_env);
-        elements.push_back(result);
+        if (!result.type) {
+          return result;
+        }
+        elements.push_back(*result.type);
       }
-      return TupleType::create(std::move(elements));
+      ret.type = TupleType::create(std::move(elements));
+      return ret;
     } else {
       std::stringstream ss;
       ss << "cannot match a tuple to " << actual->str();
-      throw TypeMatchError(ss.str());
+      ret.errMsg = ss.str();
+      return ret;
+    }
+  } else if (auto lt_formal = formal->cast<FutureType>()) {
+    if (auto lt_actual = actual->cast<FutureType>()) {
+      const auto innerType = matchTypeVariables(
+          lt_formal->getElementType(), lt_actual->getElementType(), type_env);
+      if (!innerType.type) {
+        return innerType;
+      }
+      ret.type = FutureType::create(*innerType.type);
+      return ret;
+    } else {
+      std::stringstream ss;
+      ss << "cannot match a future to " << actual->str();
+      ret.errMsg = ss.str();
+      return ret;
+    }
+  } else if (auto opt_formal = formal->cast<OptionalType>()) {
+    if (auto opt_actual = actual->cast<OptionalType>()) {
+      const auto optionedType = matchTypeVariables(
+          opt_formal->getElementType(), opt_actual->getElementType(), type_env);
+      if (!optionedType.type) {
+        return optionedType;
+      }
+      ret.type = OptionalType::create(*optionedType.type);
+      return ret;
+    } else if (!actual->isSubtypeOf(NoneType::get())) {
+      // If the actual type is a non-optional, allow matching to the formal if
+      // its element type matches the actual.
+      // Don't match None because it is already an optional (but one of
+      // unknown type).
+      return matchTypeVariables(opt_formal->getElementType(), actual, type_env);
+    } else {
+      ret.errMsg = "cannot match an Optional[T] to None, because there is no way to determine T from None.";
+      return ret;
     }
   }
+
   AT_ERROR("unhandled free variable container: ", formal->str());
 }
 
@@ -247,14 +315,12 @@ CAFFE2_API TypePtr evalTypeVariables(TypePtr type, std::unordered_map<std::strin
     auto it = type_env.find(vt->name());
     AT_ASSERTM(it != type_env.end(), "schema has unbound type variable '", vt->name(), "' in its return type");
     return it->second;
-  } else if(auto lt = type->cast<ListType>()) {
-    return ListType::create(evalTypeVariables(lt->getElementType(), type_env));
-  } else if(auto tp = type->cast<TupleType>()) {
-    return TupleType::create(fmap(tp->elements(), [&](const TypePtr& typ) {
-      return evalTypeVariables(typ, type_env);
-    }));
+  } else {
+    auto new_contained = fmap(type->containedTypes(), [&](TypePtr t) {
+      return evalTypeVariables(t, type_env);
+    });
+    return type->withContained(std::move(new_contained));
   }
-  return type;
 }
 
-}} // namespace torch::jit
+} // namespace c10
