@@ -1,10 +1,10 @@
-#include "ProcessGroupNCCL.hpp"
+#include <c10d/ProcessGroupNCCL.hpp>
 
 #include <map>
 #include <tuple>
 #include <unordered_set>
 
-#include <THC.h>
+#include <THC/THC.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGuard.h>
@@ -91,13 +91,23 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(const std::vector<at::Device>& devices)
 
 ProcessGroupNCCL::WorkNCCL::~WorkNCCL() {}
 
-// Check if the NCCL kernels are queued on the GPUs
 bool ProcessGroupNCCL::WorkNCCL::isCompleted() {
+  return finishedGPUExecution();
+}
+
+bool ProcessGroupNCCL::WorkNCCL::isSuccess() const {
   return true;
 }
 
+std::exception_ptr ProcessGroupNCCL::WorkNCCL::exception() const {
+  throw std::runtime_error(
+      "exception() is not supported by NCCL process "
+      "group's work, since isSuccess() will always return true, and "
+      "isCompleted() and wait() will either succeed or throw");
+}
+
 // Helper that checks if the NCCL kernels are completed on the GPUs
-bool ProcessGroupNCCL::WorkNCCL::finishedGPUExecution() const {
+bool ProcessGroupNCCL::WorkNCCL::finishedGPUExecution() {
   for (size_t i = 0; i < devices_.size(); ++i) {
     // Checking the work's corresponding CUDA events' status
     auto ret = cudaEventQuery(cudaEvents_[i]);
@@ -111,12 +121,6 @@ bool ProcessGroupNCCL::WorkNCCL::finishedGPUExecution() const {
   return true;
 }
 
-// Same as synchronize(), and will always return true
-bool ProcessGroupNCCL::WorkNCCL::wait() {
-  synchronize();
-  return true;
-}
-
 // Waiting on the work's corresponding CUDA events
 void ProcessGroupNCCL::WorkNCCL::synchronize() {
   for (size_t i = 0; i < devices_.size(); ++i) {
@@ -126,42 +130,45 @@ void ProcessGroupNCCL::WorkNCCL::synchronize() {
     // If we use the work to do barrier, we should block here
     if (!barrierTensors_.empty()) {
       at::cuda::CUDAGuard gpuGuard(devices_[i]);
-      AT_CUDA_CHECK(cudaStreamSynchronize(currentStream.stream()));
+      AT_CUDA_CHECK(cudaDeviceSynchronize());
     }
   }
 }
 
-bool ProcessGroupNCCL::WorkNCCL::isSuccess() const {
-  return true;
+// Same as calling synchronize().
+void ProcessGroupNCCL::WorkNCCL::wait() {
+  synchronize();
 }
 
-const std::exception& ProcessGroupNCCL::WorkNCCL::exception() const {
-  throw std::runtime_error(
-      "exception() is not supported by NCCL process "
-      "group's work, since isSuccess() will always return true, and "
-      "isCompleted() and wait() will either succeed or throw");
-}
+std::unordered_map<std::string, ssize_t> ProcessGroupNCCL::pgUniqueNCCLIDCnt_;
+std::unordered_map<std::string, ssize_t>
+    ProcessGroupNCCL::processGroupCounterMap_;
 
-std::unordered_map<ssize_t, ssize_t> ProcessGroupNCCL::pgUniqueNCCLIDCnt_;
-ssize_t ProcessGroupNCCL::processGroupCounter_ = -1;
 std::mutex ProcessGroupNCCL::pgTrackingLock_;
 
 ProcessGroupNCCL::ProcessGroupNCCL(
     const std::shared_ptr<Store>& store,
     int rank,
-    int size)
-    : ProcessGroup(rank, size), store_(store) {
+    int size,
+    const std::string& groupName)
+    : ProcessGroup(rank, size), store_(store), groupName_(groupName) {
   // Generate the Process Group ID for current PG, this needs to be identical
   // for all processes
   std::unique_lock<std::mutex> lock(pgTrackingLock_);
-  ++processGroupCounter_;
-  pgUniqueNCCLIDCnt_[processGroupCounter_] = -1;
-  processGroupID_ = std::to_string(processGroupCounter_);
+  // Default group is an empty string
+  const auto groupKey = groupName_ + "_";
+  if (processGroupCounterMap_.count(groupKey) == 0) {
+    processGroupCounterMap_[groupKey] = -1;
+  }
+  ++processGroupCounterMap_[groupKey];
+  processGroupID_ = std::to_string(processGroupCounterMap_[groupKey]);
+  groupPgID_ = groupName_ + "_" + processGroupID_;
+  pgUniqueNCCLIDCnt_[groupPgID_] = -1;
 }
 
 ProcessGroupNCCL::~ProcessGroupNCCL() {
   std::unique_lock<std::mutex> lock(pgTrackingLock_);
-  pgUniqueNCCLIDCnt_.erase(std::stoull(processGroupID_));
+  pgUniqueNCCLIDCnt_.erase(groupPgID_);
 }
 
 void ProcessGroupNCCL::broadcastUniqueNCCLID(ncclUniqueId* ncclID) {
@@ -170,9 +177,8 @@ void ProcessGroupNCCL::broadcastUniqueNCCLID(ncclUniqueId* ncclID) {
   // The key is a combination of processGroupID_ and the current count of
   // NCCL unique ID created
   std::unique_lock<std::mutex> lock(pgTrackingLock_);
-  auto processGroupIDKey = std::stoull(processGroupID_);
-  auto uniqueNCCLIDCnt = pgUniqueNCCLIDCnt_[processGroupIDKey] + 1;
-  pgUniqueNCCLIDCnt_[processGroupIDKey] = uniqueNCCLIDCnt;
+  auto groupPgId = groupName_ + "_" + processGroupID_;
+  const auto uniqueNCCLIDCnt = ++pgUniqueNCCLIDCnt_[groupPgID_];
 
   lock.unlock();
 
@@ -209,7 +215,9 @@ std::vector<std::shared_ptr<NCCLComm>>& ProcessGroupNCCL::getNCCLComm(
         "the GPU devices are not known");
   }
 
-  lastDevices_ = devices;
+  for (auto& device : devices) {
+    usedDeviceIdxs_.insert(device.index());
+  }
 
   if (devNCCLCommMap_.find(devicesKey) != devNCCLCommMap_.end()) {
     // Reuse the cached communicator if there is one.
@@ -491,7 +499,8 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::reduce(
 
 std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
-    std::vector<at::Tensor>& inputTensors) {
+    std::vector<at::Tensor>& inputTensors,
+    const AllgatherOptions& opts) {
   if (outputTensors.size() != inputTensors.size()) {
     throw std::runtime_error("allgather: input and output size mismatch");
   }
@@ -562,9 +571,10 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::allgather(
   return work;
 }
 
-std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::barrier() {
+std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::barrier(
+    const BarrierOptions& opts) {
   std::vector<at::Device> devices;
-  if (lastDevices_.empty()) {
+  if (usedDeviceIdxs_.empty()) {
     // This means there is not yet a NCCL collective being called
     // Here we have to use the best guesses and will use a single GPU to call
     // allreduce to achieve barrier.
@@ -574,7 +584,9 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::barrier() {
     int16_t deviceIdx = static_cast<int16_t>(rank_ % numGPUs);
     devices.push_back(at::Device(at::DeviceType::CUDA, deviceIdx));
   } else {
-    devices = lastDevices_;
+    for (auto usedDeviceIdx : usedDeviceIdxs_) {
+      devices.push_back(at::Device(at::DeviceType::CUDA, usedDeviceIdx));
+    }
   }
 
   std::vector<at::Tensor> barrierTensors;
@@ -629,7 +641,6 @@ std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::recv(
 
 std::shared_ptr<ProcessGroup::Work> ProcessGroupNCCL::recvAnysource(
     std::vector<at::Tensor>& /* unused */,
-    int* /* unused */,
     int /* unused */) {
   throw std::runtime_error("ProcessGroupNCCL does not support recv");
 }
